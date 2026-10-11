@@ -1,6 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -10,26 +11,56 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QMessageBox,
     QFileDialog,
+    QTextEdit,
 )
 
 from app.audio.recorder import AudioRecorder
 from app.audio.player import AudioPlayer
+
+class TranscriptionWorker(QThread):
+    completed = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, audio_path):
+        super().__init__()
+        self.audio_path = str(audio_path)
+
+    def run(self):
+        try:
+            from app.speech.speech_to_text import SpeechToText
+
+            recognizer = SpeechToText(model_size="tiny.en")
+            text = recognizer.transcribe_file(self.audio_path)
+            self.completed.emit(text)
+
+        except Exception as error:
+            self.failed.emit(str(error))
 
 class VoiceAssistantWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
         self.setWindowTitle("Voice Assistant")
-        self.setMinimumSize(700, 450)
+        self.setMinimumSize(700, 600)
 
         self.recorder = AudioRecorder()
         self.player = AudioPlayer()
         self.last_recording = None
+        self.transcription_worker = None
 
         self.recordings_dir = (
             Path(__file__).resolve().parents[2]
             /"storage"
             /"recordings"
+        )
+
+        title = QLabel("Voice Assistant")
+        title.setStyleSheet(
+            "font-size: 28px; font-weight: bold;"
+        )
+
+        description = QLabel(
+            "Phase 3: Offline Speech Recognition."
         )
 
         self.status_label = QLabel("Ready to record audio.")
@@ -39,41 +70,43 @@ class VoiceAssistantWindow(QMainWindow):
         self.stop_record_button = QPushButton("Stop Recording")
         self.play_button = QPushButton("Play Recording")
         self.stop_play_button = QPushButton("Stop Playback")
+        self.transcribe_button = QPushButton("Transcribe Recording")
 
         self.stop_record_button.setEnabled(False)
         self.play_button.setEnabled(False)
         self.stop_play_button.setEnabled(False)
+        self.transcribe_button.setEnabled(False)
 
         self.record_button.clicked.connect(self.start_recording)
         self.stop_record_button.clicked.connect(self.stop_recording)
         self.play_button.clicked.connect(self.play_recording)
         self.stop_play_button.clicked.connect(self.stop_playback)
+        self.transcribe_button.clicked.connect( self.transcribe_recording )
 
-        title = QLabel("Voice Assistant")
-        title.setStyleSheet(
-            "font-size: 28px; font-weight: bold;"
-        )
-        description = QLabel(
-            "Phase 2: Microphone Recording and Audio Playback"
-        )
-
-        audio_layout = QHBoxLayout()
-        audio_layout.addWidget(self.record_button)
-        audio_layout.addWidget(self.stop_record_button)
+        recording_layout = QHBoxLayout()
+        recording_layout.addWidget(self.record_button)
+        recording_layout.addWidget(self.stop_record_button)
 
         playback_layout = QHBoxLayout()
         playback_layout.addWidget(self.play_button)
         playback_layout.addWidget(self.stop_play_button)
 
-        layout = QHBoxLayout()
+        self.transcription_output = QTextEdit()
+        self.transcription_output.setReadOnly(True)
+        self.transcription_output.setPlaceholderText(
+            "Your recognized speech will appear here..."
+        )
+
+        layout = QVBoxLayout()
         layout.addWidget(title)
         layout.addWidget(description)
-        layout.addSpacing(20)
-        layout.addLayout(audio_layout)
+        layout.addSpacing(12)
+        layout.addLayout(recording_layout)
         layout.addLayout(playback_layout)
-        layout.addSpacing(15)
+        layout.addWidget(self.transcribe_button)
+        layout.addWidget(QLabel("Recognized Speech"))
+        layout.addWidget(self.transcription_output)
         layout.addWidget(self.status_label)
-        layout.addStretch()
 
         container = QWidget()
         container.setLayout(layout)
@@ -89,12 +122,14 @@ class VoiceAssistantWindow(QMainWindow):
             self.player.stop()
             self.recorder.start_recording(output_path)
 
+            self.last_recording = None
             self.record_button.setEnabled(False)
             self.stop_record_button.setEnabled(True)
             self.play_button.setEnabled(False)
             self.stop_play_button.setEnabled(False)
+            self.transcribe_button.setEnabled(False)
 
-            self.status_label.settext(
+            self.status_label.setText(
                 "Recording... Speak into your microphone,"
                 "then press Stop Recording."
             )
@@ -102,7 +137,7 @@ class VoiceAssistantWindow(QMainWindow):
             QMessageBox.critical(
                 self,
                 "Recording Error",
-                f"Could not start recording:\n{error}",
+                str(error),
             )
     
     def stop_recording(self):
@@ -112,6 +147,7 @@ class VoiceAssistantWindow(QMainWindow):
             if saved_path is not None and saved_path.exists():
                 self.last_recording = saved_path
                 self.play_button.setEnabled(True)
+                self.transcribe_button.setEnabled(True)
 
                 self.status_label.setText(
                     f"Recording saved successfully:\n{saved_path}"
@@ -124,7 +160,7 @@ class VoiceAssistantWindow(QMainWindow):
             QMessageBox.critical(
                 self,
                 "Recording Error",
-                f"Could not stop recording cleanly:\n{error}",
+                str(error),
             )
         
         finally:
@@ -138,7 +174,7 @@ class VoiceAssistantWindow(QMainWindow):
             selected_path, _ = QFileDialog.getOpenFileName(
                 self,
                 "Select an audio recording",
-                str(self.recording_dir),
+                str(self.recordings_dir),
                 "WAV Audio (*.wav)",
             )
 
@@ -152,22 +188,99 @@ class VoiceAssistantWindow(QMainWindow):
             self.stop_play_button.setEnabled(True)
 
             self.status_label.setText(
-                f"Playing recording:\n{audio_path}"
+                f"Playing:\n{audio_path}"
             )
 
         except Exception as error:
             QMessageBox.critical(
                 self, 
                 "Playback Error",
-                f"Could not play audio:\n{error}",
+                str(error),
             )
 
     def stop_playback(self):
-        self.playing.stop()
+        self.player.stop()
         self.stop_play_button.setEnabled(False)
         self.status_label.setText("Playback stopped.")
 
+    def transcribe_recording(self):
+        if self.recorder.is_recording:
+            QMessageBox.warning(
+                self,
+                "Recording in Progress",
+                "Stop recording before transcribing.",
+            )
+            return
+        
+        audio_path = self.last_recording
+
+        if audio_path is None or not audio_path.exists():
+            selected_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select a recording to transcribe",
+                str(self.recordings_dir),
+                "WAV Audio (*.wav)",
+            )
+            if not selected_path:
+                return
+            
+            audio_path = Path(selected_path)
+
+        self.transcribe_button.setEnabled(False)
+        self.status_label.setText(
+            "Loading the speech model and transcribing..."
+            "The first run may take longer..."
+        )
+        self.transcription_output.clear()
+
+        self.transcription_worker = TranscriptionWorker(audio_path)
+
+        self.transcription_worker.completed.connect(
+            self.on_transcription_completed
+        )
+        self.transcription_worker.failed.connect(
+            self.on_transcription_failed
+        )
+        self.transcription_worker.finished.connect(
+            self.on_transcription_finished
+        )
+        self.transcription_worker.start()
+
+    def on_transcription_completed(self, text):
+        self.transcription_output.setPlainText(
+            text or "No speech was recognized."
+        )
+
+        self.status_label.setText(
+            "Transcription completed."
+        )
+
+    def on_transcription_failed(self, error):
+        self.status_label.setText("Transcription_failed.")
+        QMessageBox.critical(
+            self,
+            "Transcription Error",
+            error,
+        )
+
+    def on_transcription_finished(self):
+        self.transcribe_button.setEnabled(
+            self.last_recording is not None
+            or self.recording_dir.exists()
+        )
+        self.transcription_worker = None
+
     def closeEvent(self, event):
+        if self.transcription_worker is not None:
+            if self.transcription_worker.isRunning():
+                QMessageBox.warning(
+                    self,
+                    "Transcription in Progress",
+                    "Wait for transcription to finish before closing.",
+                )
+                event.ignore()
+                return
+
         if self.recorder.is_recording:
             self.recorder.stop_recording()
 
