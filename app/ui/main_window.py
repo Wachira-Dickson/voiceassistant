@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
 
 from app.audio.recorder import AudioRecorder
 from app.audio.player import AudioPlayer
+from app.documents.reader import DocumentReader
+from app.speech.text_to_speech import TextToSpeech
 
 class TranscriptionWorker(QThread):
     completed = Signal(str)
@@ -36,23 +38,49 @@ class TranscriptionWorker(QThread):
         except Exception as error:
             self.failed.emit(str(error))
 
+class SpeechWorker(QThread):
+    completed = Signal()
+    failed = Signal(str)
+
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+        self.speaker = None
+
+    def run(self):
+        try:
+            self.speaker = TextToSpeech()
+            self.speaker.speak(self.text)
+            self.completed.emit()
+        except Exception as error:
+            self.failed.emit(str(error))
+
+    def stop_speaking(self):
+        if self.speaker is not None:
+            self.speaker.stop()
+
 class VoiceAssistantWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
         self.setWindowTitle("Voice Assistant")
-        self.setMinimumSize(700, 600)
+        self.setMinimumSize(750, 700)
 
         self.recorder = AudioRecorder()
         self.player = AudioPlayer()
+        self.document_reader = DocumentReader()
+
         self.last_recording = None
         self.transcription_worker = None
+        self.speech_worker = None
+        self.document_text = ""
 
-        self.recordings_dir = (
-            Path(__file__).resolve().parents[2]
-            /"storage"
-            /"recordings"
-        )
+        project_dir = Path(__file__).resolve().parents[2]
+        self.recordings_dir = project_dir / "storage" / "recordings"
+        self.documents_dir = project_dir / "storage" / "documents"
+
+        self.recordings_dir.mkdir(parents=True, exist_ok=True)
+        self.documents_dir.mkdir(parents=True, exist_ok=True)
 
         title = QLabel("Voice Assistant")
         title.setStyleSheet(
@@ -60,10 +88,11 @@ class VoiceAssistantWindow(QMainWindow):
         )
 
         description = QLabel(
-            "Phase 3: Offline Speech Recognition."
+            "Record audio, transcribe speech, and listen to text documents."
         )
+        description.setWordWrap(True)
 
-        self.status_label = QLabel("Ready to record audio.")
+        self.status_label = QLabel("Ready.")
         self.status_label.setWordWrap(True)
 
         self.record_button = QPushButton("Record Voice")
@@ -91,6 +120,28 @@ class VoiceAssistantWindow(QMainWindow):
         playback_layout.addWidget(self.play_button)
         playback_layout.addWidget(self.stop_play_button)
 
+        # Document controls
+        self.open_document_button = QPushButton("Open Text File")
+        self.read_aloud_button = QPushButton("Read Aoud")
+        self.stop_speaking_button = QPushButton("Stop Speaking")
+
+        self.read_aloud_button.setEnabled(False)
+        self.stop_speaking_button.setEnabled(False)
+
+        self.open_document_button.clicked.connect(self.open_document)
+        self.read_aloud_button.clicked.connect(self.read_aloud)
+        self.stop_speaking_button.clicked.connect(self.stop_speaking)
+
+        document_controls = QHBoxLayout()
+        document_controls.addWidget(self.open_document_button)
+        document_controls.addWidget(self.read_aloud_button)
+        document_controls.addWidget(self.stop_speaking_button)
+
+        self.document_output = QTextEdit()
+        self.document_output.setPlaceholderText(
+            "Open a .txt document to display its contents here."
+        )
+
         self.transcription_output = QTextEdit()
         self.transcription_output.setReadOnly(True)
         self.transcription_output.setPlaceholderText(
@@ -100,12 +151,20 @@ class VoiceAssistantWindow(QMainWindow):
         layout = QVBoxLayout()
         layout.addWidget(title)
         layout.addWidget(description)
-        layout.addSpacing(12)
+        layout.addSpacing(10)
+
+        layout.addWidget(QLabel("Audio Recording"))
         layout.addLayout(recording_layout)
         layout.addLayout(playback_layout)
         layout.addWidget(self.transcribe_button)
+
+        layout.addSpacing(10)
+        layout.addWidget(QLabel("Document Reader"))
+        layout.addLayout(document_controls)
+        layout.addWidget(self.document_output, 2)
+
         layout.addWidget(QLabel("Recognized Speech"))
-        layout.addWidget(self.transcription_output)
+        layout.addWidget(self.transcription_output, 1)
         layout.addWidget(self.status_label)
 
         container = QWidget()
@@ -137,7 +196,7 @@ class VoiceAssistantWindow(QMainWindow):
             QMessageBox.critical(
                 self,
                 "Recording Error",
-                str(error),
+                str(error)
             )
     
     def stop_recording(self):
@@ -148,11 +207,11 @@ class VoiceAssistantWindow(QMainWindow):
                 self.last_recording = saved_path
                 self.play_button.setEnabled(True)
                 self.transcribe_button.setEnabled(True)
-
                 self.status_label.setText(
                     f"Recording saved successfully:\n{saved_path}"
                 )
-            else: self.status_label.setText(
+            else:
+                self.status_label.setText(
                 "No recording was saved."
             )
                 
@@ -212,6 +271,10 @@ class VoiceAssistantWindow(QMainWindow):
             )
             return
         
+        if self.transcription_worker is not None:
+            if self.transcription_worker.isRunning():
+                return
+        
         audio_path = self.last_recording
 
         if audio_path is None or not audio_path.exists():
@@ -233,18 +296,18 @@ class VoiceAssistantWindow(QMainWindow):
         )
         self.transcription_output.clear()
 
-        self.transcription_worker = TranscriptionWorker(audio_path)
+        worker = TranscriptionWorker(audio_path)
 
-        self.transcription_worker.completed.connect(
+        worker.completed.connect(
             self.on_transcription_completed
         )
-        self.transcription_worker.failed.connect(
+        worker.failed.connect(
             self.on_transcription_failed
         )
-        self.transcription_worker.finished.connect(
+        worker.finished.connect(
             self.on_transcription_finished
         )
-        self.transcription_worker.start()
+        worker.start()
 
     def on_transcription_completed(self, text):
         self.transcription_output.setPlainText(
@@ -266,13 +329,87 @@ class VoiceAssistantWindow(QMainWindow):
     def on_transcription_finished(self):
         self.transcribe_button.setEnabled(
             self.last_recording is not None
-            or self.recording_dir.exists()
+            or self.recordings_dir.exists()
         )
         self.transcription_worker = None
 
+    def open_document(self):
+        selected_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open a text document",
+            str(self.documents_dir),
+            "Text Files (*.txt)",
+        )
+
+        if not selected_path:
+            return
+        
+        try:
+            text = self.document_reader.read(selected_path)
+
+            self.document_text = text
+            self.document_output.setPlainText(text)
+            self.read_aloud_button.setEnabled(bool(text.strip()))
+            self.status_label.setText(
+                f"Document loaded: {Path(selected_path).name}"
+            )
+
+        except Exception as error:
+            QMessageBox.critical(self, "Document Error", str(error))
+
+    def read_aloud(self):
+        if self.speech_worker is not None:
+            if self.speech_worker.isRunning():
+                return
+            
+        text = self.document_output.toPlainText().strip()
+        print("DEBUG: Text length:", len(text))
+        print("DEBUG: Text preview:", repr(text[:100]))
+
+        if not text:
+            QMessageBox.information(
+                self, "No Text", "Open a text document first."
+            )
+            return
+        
+        self.read_aloud_button.setEnabled(False)
+        self.stop_speaking_button.setEnabled(True)
+        self.status_label.setText("Reading document aloud...")
+
+        worker = SpeechWorker(text)
+        self.speech_worker = worker
+
+        worker.completed.connect(self.on_speech_completed)
+        worker.failed.connect(self.on_speech_failed)
+        worker.finished.connect(self.on_speech_finished)
+        worker.start()
+
+    def stop_speaking(self):
+        if self.speech_worker is not None:
+            self.speech_worker.stop_speaking()
+            self.status_label.setText("Stopping speech....")
+
+    def on_speech_completed(self):
+        self.status_label.setText("Finished reading document.")
+
+    def on_speech_failed(self, error):
+        self.status_label.setText("Speech failed.")
+        QMessageBox.critical(self, "Text-to-Speech Error", error)
+
+    def on_speech_finished(self):
+        self.read_aloud_button.setEnabled(
+            bool(self.document_output.toPlainText().strip())
+        )
+        self.stop_speaking_button.setEnabled(False)
+        self.speech_worker = None
+
+
     def closeEvent(self, event):
-        if self.transcription_worker is not None:
-            if self.transcription_worker.isRunning():
+        for worker in (
+            self.transcription_worker,
+            self.speech_worker,
+        ):
+            if worker is not None and worker.isRunning():
                 QMessageBox.warning(
                     self,
                     "Transcription in Progress",
